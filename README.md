@@ -5,7 +5,9 @@ its first media profile. One URL in, one URL out.
 
 ## Demo
 
-[![asciicast](https://asciinema.org/a/4YYnLqgGccBzRkzc.svg)](https://asciinema.org/a/4YYnLqgGccBzRkzc)
+![demo](demo.gif)
+
+Watch with pause/seek on [asciinema.org](https://asciinema.org/a/4YYnLqgGccBzRkzc).
 
 ## Install
 
