@@ -3,6 +3,10 @@
 Given an ONVIF device service URL, query the camera and print the RTSP URI of
 its first media profile. One URL in, one URL out.
 
+## Demo
+
+[![asciicast](https://asciinema.org/a/4YYnLqgGccBzRkzc.svg)](https://asciinema.org/a/4YYnLqgGccBzRkzc)
+
 ## Install
 
     chmod +x onvif-rtsp
