@@ -33,6 +33,7 @@ Write the result to a file:
 | `DEVICE_URL` (positional) | from stdin | ONVIF device service URL (must start with `http://` or `https://`) |
 | `--user USER` | unset | ONVIF username; must be paired with `--password` |
 | `--password PASSWORD` | unset | ONVIF password; must be paired with `--user` |
+| `--inject-credentials` | off | prepend URL-encoded `user:password@` to the RTSP URL (requires `--user`/`--password`; overwrites any userinfo already in the URL and warns on stderr if it does so) |
 | `-t`, `--timeout SECONDS` | `10.0` | per-request HTTP timeout |
 | `-o`, `--output FILE` | stdout | write the RTSP URL to FILE instead of stdout |
 | `-v`, `--verbose` | off | log progress on stderr (passwords are never logged) |
@@ -50,6 +51,11 @@ returns, verbatim, followed by a newline.
 When credentials are provided, every request carries a fresh WS-Security
 UsernameToken with PasswordDigest (SHA-1). Nonces and timestamps are
 regenerated per request.
+
+By default the RTSP URL is printed exactly as the device returned it (no
+credentials embedded). If your camera requires HTTP-style auth in the RTSP
+URL itself, pass `--inject-credentials` to get
+`rtsp://user:password@host/...` (user and password are percent-encoded).
 
 ## Exit codes
 

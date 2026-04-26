@@ -274,6 +274,63 @@ class CliHappyPathTests(unittest.TestCase):
             self.assertNotIn(b"topsecret", body)
 
 
+class InjectCredentialsUnitTests(unittest.TestCase):
+    def test_basic_injection(self):
+        new, replaced = orx.inject_credentials(
+            "rtsp://192.168.0.73/live/ch00_1", "admin", "admin",
+        )
+        self.assertEqual(new, "rtsp://admin:admin@192.168.0.73/live/ch00_1")
+        self.assertFalse(replaced)
+
+    def test_preserves_port_and_query(self):
+        new, _ = orx.inject_credentials(
+            "rtsp://cam:554/path?x=1", "u", "p",
+        )
+        self.assertEqual(new, "rtsp://u:p@cam:554/path?x=1")
+
+    def test_url_encodes_special_chars(self):
+        new, _ = orx.inject_credentials(
+            "rtsp://cam/s", "us er", "p@ss:wd/!",
+        )
+        # @, :, /, space, ! must be percent-encoded inside userinfo.
+        self.assertEqual(new, "rtsp://us%20er:p%40ss%3Awd%2F%21@cam/s")
+
+    def test_overwrites_existing_userinfo(self):
+        new, replaced = orx.inject_credentials(
+            "rtsp://old:old@cam/s", "new", "new",
+        )
+        self.assertEqual(new, "rtsp://new:new@cam/s")
+        self.assertTrue(replaced)
+
+
+class CliInjectCredentialsTests(unittest.TestCase):
+    def setUp(self):
+        self.cam = _happy_cam()
+
+    def tearDown(self):
+        self.cam.stop()
+
+    def test_inject_prepends_creds(self):
+        r = _run_cli([
+            "--user", "admin", "--password", "admin",
+            "--inject-credentials",
+            self.cam.url("/onvif/device_service"),
+        ])
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.assertEqual(
+            r.stdout.strip(),
+            "rtsp://admin:admin@127.0.0.1:554/Streaming/Channels/101",
+        )
+
+    def test_inject_without_credentials_errors(self):
+        r = _run_cli([
+            "--inject-credentials",
+            self.cam.url("/onvif/device_service"),
+        ])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--inject-credentials requires --user", r.stderr)
+
+
 class CliErrorPathTests(unittest.TestCase):
     def test_http_401(self):
         cam = FakeCam(); cam.start()
