@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""onvif-rtsp: given an ONVIF device service URL, print its first profile's RTSP URI.
+
+Performs three SOAP calls (GetCapabilities, GetProfiles, GetStreamUri) and
+prints exactly one RTSP URL on stdout. Designed to chain after onvif-discover.
+"""
+
+import argparse
+import base64
+import datetime as _dt
+import hashlib
+import os
+import secrets
+import sys
+import xml.etree.ElementTree as ET
+from typing import Optional, Tuple
+from urllib.parse import urlparse
+from xml.sax.saxutils import escape as xml_escape
+
+VERSION = "1.0.0"
+PROG = "onvif-rtsp"
+
+NS = {
+    "s":    "http://www.w3.org/2003/05/soap-envelope",
+    "tds":  "http://www.onvif.org/ver10/device/wsdl",
+    "trt":  "http://www.onvif.org/ver10/media/wsdl",
+    "tt":   "http://www.onvif.org/ver10/schema",
+    "wsse": "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd",
+    "wsu":  "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd",
+}
+
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_NETWORK = 2
+EXIT_AUTH = 3
+EXIT_PROTOCOL = 4
+EXIT_INTERRUPT = 130
+
+
+class _Err(Exception):
+    def __init__(self, code: int, msg: str):
+        super().__init__(msg)
+        self.code = code
+        self.msg = msg
+
+
+class NetworkError(_Err):
+    def __init__(self, msg): super().__init__(EXIT_NETWORK, msg)
+
+
+class AuthError(_Err):
+    def __init__(self, msg): super().__init__(EXIT_AUTH, msg)
+
+
+class ProtocolError(_Err):
+    def __init__(self, msg): super().__init__(EXIT_PROTOCOL, msg)
+
+
+def log(verbose: bool, msg: str) -> None:
+    if verbose:
+        print(f"{PROG}: {msg}", file=sys.stderr)
+
+
+def err(msg: str) -> None:
+    print(f"{PROG}: {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# WS-Security UsernameToken (PasswordDigest, SHA-1)
+# ---------------------------------------------------------------------------
+
+def _make_security_header(user: str, password: str) -> str:
+    """Build a fresh <wsse:Security> header. Nonce/Created are regenerated
+    on every call — never reuse them across requests."""
+    nonce_bytes = secrets.token_bytes(16)
+    created = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    digest = base64.b64encode(
+        hashlib.sha1(nonce_bytes + created.encode("utf-8") + password.encode("utf-8")).digest()
+    ).decode("ascii")
+    nonce_b64 = base64.b64encode(nonce_bytes).decode("ascii")
+    return (
+        '<wsse:Security s:mustUnderstand="1"'
+        f' xmlns:wsse="{NS["wsse"]}"'
+        f' xmlns:wsu="{NS["wsu"]}">'
+        '<wsse:UsernameToken>'
+        f'<wsse:Username>{xml_escape(user)}</wsse:Username>'
+        '<wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
+        f'{digest}</wsse:Password>'
+        '<wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/'
+        f'oasis-200401-wss-soap-message-security-1.0#Base64Binary">{nonce_b64}</wsse:Nonce>'
+        f'<wsu:Created>{created}</wsu:Created>'
+        '</wsse:UsernameToken>'
+        '</wsse:Security>'
+    )
+
+
+def _envelope(body_inner: str, user: Optional[str], password: Optional[str]) -> bytes:
+    """Wrap a SOAP body fragment in an Envelope, optionally with WS-Security."""
+    header = ""
+    if user is not None:
+        header = "<s:Header>" + _make_security_header(user, password or "") + "</s:Header>"
+    env = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<s:Envelope xmlns:s="{NS["s"]}">'
+        f'{header}'
+        f'<s:Body>{body_inner}</s:Body>'
+        '</s:Envelope>'
+    )
+    return env.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# SOAP transport
+# ---------------------------------------------------------------------------
+
+def _post_soap(session, url: str, body: bytes, action: str, timeout: float):
+    """POST a SOAP envelope. Returns (status_code, parsed_root_or_None, raw_bytes).
+    Raises NetworkError on connection problems."""
+    import requests
+    headers = {
+        "Content-Type": f'application/soap+xml; charset=utf-8; action="{action}"',
+        "Accept": "application/soap+xml, text/xml, */*",
+    }
+    try:
+        r = session.post(url, data=body, headers=headers, timeout=timeout)
+    except requests.exceptions.ConnectTimeout:
+        raise NetworkError(f"connection timed out: {url}")
+    except requests.exceptions.ReadTimeout:
+        raise NetworkError(f"request timed out: {url}")
+    except requests.exceptions.Timeout:
+        raise NetworkError(f"request timed out: {url}")
+    except requests.exceptions.ConnectionError as e:
+        raise NetworkError(f"could not connect to {url}: {_short(e)}")
+
+    raw = r.content
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        root = None
+    return r.status_code, root, raw
+
+
+def _short(exc: BaseException) -> str:
+    """Compact one-liner for an exception, hiding nested gunk."""
+    s = str(exc)
+    # requests wraps things in long ConnectionError(MaxRetry(...))
+    for marker in (": ", " => ", " - "):
+        if marker in s:
+            s = s.split(marker, 1)[-1]
+    return s.strip().splitlines()[0][:200] if s else exc.__class__.__name__
+
+
+def _check_fault(status: int, root, raw: bytes, url: str) -> None:
+    """If the response is a fault, raise the appropriate _Err. Otherwise return."""
+    if root is None:
+        if status == 401:
+            raise AuthError("authentication failed: device returned HTTP 401")
+        raise ProtocolError(f"server returned non-XML response (HTTP {status})")
+
+    fault = _find(root, "s:Body/s:Fault", "{*}Body/{*}Fault")
+    if fault is not None:
+        reason = (
+            _find_text(fault, "s:Reason/s:Text", "{*}Reason/{*}Text")
+            or _find_text(fault, "s:faultstring", "{*}faultstring")
+            or "(unknown)"
+        )
+        subcode_chain = []
+        node = fault
+        for _ in range(4):
+            sub = _find(node, "s:Code/s:Subcode", "{*}Code/{*}Subcode")
+            if sub is None:
+                break
+            v = _find_text(sub, "s:Value", "{*}Value")
+            if v:
+                subcode_chain.append(v)
+            node = sub
+        subcode_blob = " ".join(subcode_chain).lower()
+        if (
+            "notauthorized" in subcode_blob
+            or "auth" in reason.lower()
+            or "sender not authorized" in reason.lower()
+        ):
+            raise AuthError(f"authentication failed: {reason}")
+        raise ProtocolError(f"SOAP fault: {reason}")
+
+    if status == 401:
+        raise AuthError("authentication failed: device returned HTTP 401")
+    if not (200 <= status < 300):
+        raise ProtocolError(f"HTTP {status} from {url}")
+
+
+# ---------------------------------------------------------------------------
+# Tiny XPath helpers with namespace + wildcard fallback
+# ---------------------------------------------------------------------------
+
+def _find(root, ns_path: str, wild_path: str):
+    """Find with explicit NS map first, fall back to wildcard namespaces."""
+    el = root.find(".//" + ns_path, NS)
+    if el is None:
+        el = root.find(".//" + wild_path)
+    return el
+
+
+def _find_text(root, ns_path: str, wild_path: str) -> Optional[str]:
+    el = _find(root, ns_path, wild_path)
+    return el.text.strip() if (el is not None and el.text) else None
+
+
+# ---------------------------------------------------------------------------
+# ONVIF calls
+# ---------------------------------------------------------------------------
+
+def get_media_xaddr(session, device_url: str, user, password, timeout, verbose) -> str:
+    log(verbose, f"GetCapabilities -> {device_url}")
+    body = _envelope(
+        '<tds:GetCapabilities xmlns:tds="' + NS["tds"] + '">'
+        '<tds:Category>Media</tds:Category>'
+        '</tds:GetCapabilities>',
+        user, password,
+    )
+    status, root, raw = _post_soap(
+        session, device_url, body,
+        "http://www.onvif.org/ver10/device/wsdl/GetCapabilities", timeout,
+    )
+    _check_fault(status, root, raw, device_url)
+    xaddr = _find_text(root, "tt:Media/tt:XAddr", "{*}Media/{*}XAddr")
+    if not xaddr:
+        raise ProtocolError("device did not return a Media service address")
+    log(verbose, f"media service: {xaddr}")
+    return xaddr
+
+
+def get_first_profile_token(session, media_url: str, user, password, timeout, verbose) -> str:
+    log(verbose, f"GetProfiles -> {media_url}")
+    body = _envelope(
+        '<trt:GetProfiles xmlns:trt="' + NS["trt"] + '"/>',
+        user, password,
+    )
+    status, root, raw = _post_soap(
+        session, media_url, body,
+        "http://www.onvif.org/ver10/media/wsdl/GetProfiles", timeout,
+    )
+    _check_fault(status, root, raw, media_url)
+    profiles = root.findall(".//trt:Profiles", NS) or root.findall(".//{*}Profiles")
+    if not profiles:
+        raise ProtocolError("device returned no media profiles")
+    token = profiles[0].get("token")
+    if not token:
+        raise ProtocolError("first media profile has no token attribute")
+    log(verbose, f"first profile token: {token}")
+    return token
+
+
+def get_stream_uri(session, media_url: str, profile_token: str,
+                   user, password, timeout, verbose) -> str:
+    log(verbose, f"GetStreamUri -> {media_url}")
+    body = _envelope(
+        '<trt:GetStreamUri'
+        f' xmlns:trt="{NS["trt"]}" xmlns:tt="{NS["tt"]}">'
+        '<trt:StreamSetup>'
+        '<tt:Stream>RTP-Unicast</tt:Stream>'
+        '<tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport>'
+        '</trt:StreamSetup>'
+        f'<trt:ProfileToken>{xml_escape(profile_token)}</trt:ProfileToken>'
+        '</trt:GetStreamUri>',
+        user, password,
+    )
+    status, root, raw = _post_soap(
+        session, media_url, body,
+        "http://www.onvif.org/ver10/media/wsdl/GetStreamUri", timeout,
+    )
+    _check_fault(status, root, raw, media_url)
+    uri = _find_text(root, "tt:Uri", "{*}Uri")
+    if not uri:
+        raise ProtocolError("device did not return an RTSP URI")
+    return uri
+
+
+def fetch_rtsp(device_url: str, user, password, timeout, verbose) -> str:
+    """Run the three SOAP calls and return the RTSP URI."""
+    import requests
+    session = requests.Session()
+    try:
+        media_url = get_media_xaddr(session, device_url, user, password, timeout, verbose)
+        token = get_first_profile_token(session, media_url, user, password, timeout, verbose)
+        return get_stream_uri(session, media_url, token, user, password, timeout, verbose)
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI plumbing
+# ---------------------------------------------------------------------------
+
+def _read_url_from_stdin() -> Optional[str]:
+    """Return the first non-empty line from stdin, or None if none."""
+    for line in sys.stdin:
+        line = line.strip()
+        if line:
+            return line
+    return None
+
+
+def _validate_url(url: str) -> None:
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.netloc:
+        raise _Err(EXIT_USAGE, f"not an HTTP(S) URL: {url}")
+
+
+def _validate_credentials(user, password) -> Tuple[Optional[str], Optional[str]]:
+    """Return (user, password) where both are str-or-both-None.
+    Raise on the half-set case. Empty strings are treated as None."""
+    if user == "":
+        user = None
+    if password == "":
+        password = None
+    if user is None and password is not None:
+        raise _Err(EXIT_USAGE, "--password given without --user")
+    if user is not None and password is None:
+        raise _Err(EXIT_USAGE, "--user given without --password")
+    return user, password
+
+
+def _check_dependencies() -> None:
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        err("python module 'requests' not found (install with: pip install requests)")
+        sys.exit(EXIT_USAGE)
+
+
+def _write_output(text: str, output_path: str) -> int:
+    if output_path == "-":
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return EXIT_OK
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        err(f"could not write {output_path}: {e.strerror or e}")
+        return EXIT_USAGE
+    return EXIT_OK
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Resolve an ONVIF device service URL to the RTSP URI of its first media profile.",
+        epilog="If DEVICE_URL is omitted, one URL is read from stdin (first non-empty line).",
+        add_help=False,
+    )
+    p.add_argument("device_url", nargs="?", metavar="DEVICE_URL")
+    p.add_argument("--user", default=None, metavar="USER",
+                   help="ONVIF username (must be paired with --password)")
+    p.add_argument("--password", default=None, metavar="PASSWORD",
+                   help="ONVIF password (must be paired with --user)")
+    p.add_argument("-t", "--timeout", type=float, default=10.0, metavar="SECONDS",
+                   help="HTTP timeout per request, in seconds (default: 10.0)")
+    p.add_argument("-o", "--output", default="-", metavar="FILE",
+                   help="write the RTSP URL to FILE instead of stdout")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="log progress on stderr")
+    p.add_argument("-V", "--version", action="store_true",
+                   help="print version and exit")
+    p.add_argument("-h", "--help", action="store_true",
+                   help="show this help and exit")
+    return p
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.help:
+        parser.print_help()
+        return EXIT_OK
+    if args.version:
+        print(f"{PROG} {VERSION}")
+        return EXIT_OK
+
+    _check_dependencies()
+
+    try:
+        user, password = _validate_credentials(args.user, args.password)
+
+        if args.timeout <= 0:
+            raise _Err(EXIT_USAGE, "timeout must be > 0")
+
+        device_url = args.device_url
+        if device_url is None:
+            if sys.stdin.isatty():
+                raise _Err(EXIT_USAGE, "no device URL given and stdin is a terminal")
+            device_url = _read_url_from_stdin()
+            if device_url is None:
+                raise _Err(EXIT_USAGE, "no device URL on stdin")
+
+        _validate_url(device_url)
+
+        rtsp = fetch_rtsp(device_url, user, password, args.timeout, args.verbose)
+    except _Err as e:
+        err(e.msg)
+        return e.code
+    except KeyboardInterrupt:
+        err("interrupted")
+        return EXIT_INTERRUPT
+
+    return _write_output(rtsp + "\n", args.output)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        err("interrupted")
+        sys.exit(EXIT_INTERRUPT)
