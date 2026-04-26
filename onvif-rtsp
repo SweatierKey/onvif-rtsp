@@ -78,8 +78,12 @@ def _make_security_header(user: str, password: str) -> str:
         hashlib.sha1(nonce_bytes + created.encode("utf-8") + password.encode("utf-8")).digest()
     ).decode("ascii")
     nonce_b64 = base64.b64encode(nonce_bytes).decode("ascii")
+    # Note: no s:mustUnderstand="1" on Security — many embedded SOAP stacks
+    # (gSOAP-based cameras) reply with a MustUnderstand fault on the device
+    # service when they have no WS-Security handler bound there, even if they
+    # would happily authenticate the same token on the media service.
     return (
-        '<wsse:Security s:mustUnderstand="1"'
+        '<wsse:Security'
         f' xmlns:wsse="{NS["wsse"]}"'
         f' xmlns:wsu="{NS["wsu"]}">'
         '<wsse:UsernameToken>'
