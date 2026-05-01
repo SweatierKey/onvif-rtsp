@@ -223,6 +223,60 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(orx._validate_credentials("", ""), (None, None))
 
 
+class ResolveCredentialsTests(unittest.TestCase):
+    def test_cli_only(self):
+        self.assertEqual(orx._resolve_credentials("u", "p", env={}), ("u", "p"))
+
+    def test_env_only(self):
+        env = {"ONVIF_USER": "envu", "ONVIF_PASSWORD": "envp"}
+        self.assertEqual(orx._resolve_credentials(None, None, env=env), ("envu", "envp"))
+
+    def test_cli_overrides_env(self):
+        env = {"ONVIF_USER": "envu", "ONVIF_PASSWORD": "envp"}
+        self.assertEqual(orx._resolve_credentials("cli", "clip", env=env), ("cli", "clip"))
+
+    def test_half_set_env_raises(self):
+        with self.assertRaises(orx._Err):
+            orx._resolve_credentials(None, None, env={"ONVIF_USER": "u"})
+        with self.assertRaises(orx._Err):
+            orx._resolve_credentials(None, None, env={"ONVIF_PASSWORD": "p"})
+
+    def test_empty_env_treated_as_unset(self):
+        self.assertEqual(
+            orx._resolve_credentials(None, None,
+                                     env={"ONVIF_USER": "", "ONVIF_PASSWORD": ""}),
+            (None, None),
+        )
+
+
+class SelectProfileTokenTests(unittest.TestCase):
+    profiles = [("tokA", "MainStream"), ("tokB", "SubStream"), ("tokC", "Audio")]
+
+    def test_default_first(self):
+        self.assertEqual(orx.select_profile_token(self.profiles, 0, None), "tokA")
+
+    def test_index(self):
+        self.assertEqual(orx.select_profile_token(self.profiles, 1, None), "tokB")
+
+    def test_name_match(self):
+        self.assertEqual(orx.select_profile_token(self.profiles, 0, "SubStream"), "tokB")
+
+    def test_token_match_via_name(self):
+        # Real-world: some integrators only know the token, not the friendly name.
+        self.assertEqual(orx.select_profile_token(self.profiles, 0, "tokC"), "tokC")
+
+    def test_name_wins_over_index(self):
+        self.assertEqual(orx.select_profile_token(self.profiles, 99, "MainStream"), "tokA")
+
+    def test_index_out_of_range(self):
+        with self.assertRaises(orx.ProtocolError):
+            orx.select_profile_token(self.profiles, 5, None)
+
+    def test_name_not_found(self):
+        with self.assertRaises(orx.ProtocolError):
+            orx.select_profile_token(self.profiles, 0, "nope")
+
+
 # ---------------------------------------------------------------------------
 # End-to-end CLI tests via the fake camera
 # ---------------------------------------------------------------------------
@@ -328,7 +382,89 @@ class CliInjectCredentialsTests(unittest.TestCase):
             self.cam.url("/onvif/device_service"),
         ])
         self.assertEqual(r.returncode, 1)
-        self.assertIn("--inject-credentials requires --user", r.stderr)
+        self.assertIn("--inject-credentials requires credentials", r.stderr)
+
+    def test_credentials_via_env(self):
+        # Same as test_inject_prepends_creds but credentials come via env
+        # vars instead of CLI flags — what nvrd uses to keep them out of
+        # `/proc/*/cmdline`.
+        env = dict(os.environ)
+        env["ONVIF_USER"] = "admin"
+        env["ONVIF_PASSWORD"] = "admin"
+        r = _run_cli([
+            "--inject-credentials",
+            self.cam.url("/onvif/device_service"),
+        ], env=env)
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.assertEqual(
+            r.stdout.strip(),
+            "rtsp://admin:admin@127.0.0.1:554/Streaming/Channels/101",
+        )
+
+    def test_password_via_env_alone_errors(self):
+        env = dict(os.environ); env["ONVIF_PASSWORD"] = "secret"
+        r = _run_cli([self.cam.url("/onvif/device_service")], env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("password given without username", r.stderr)
+
+
+class CliProfileSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.cam = _happy_cam()
+
+    def tearDown(self):
+        self.cam.stop()
+
+    def test_default_picks_first_profile(self):
+        r = _run_cli([self.cam.url("/onvif/device_service")])
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        # The fake server returns the same Uri regardless of token, so what
+        # we want to check is which token GetStreamUri was called with.
+        stream_bodies = [b for path, action, b in self.cam.requests
+                         if action.endswith("GetStreamUri")]
+        self.assertEqual(len(stream_bodies), 1)
+        self.assertIn(b"<trt:ProfileToken>MainProfile</trt:ProfileToken>",
+                      stream_bodies[0])
+
+    def test_profile_index_one_picks_substream(self):
+        r = _run_cli(["--profile-index", "1",
+                      self.cam.url("/onvif/device_service")])
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        stream_bodies = [b for path, action, b in self.cam.requests
+                         if action.endswith("GetStreamUri")]
+        self.assertIn(b"<trt:ProfileToken>SubProfile</trt:ProfileToken>",
+                      stream_bodies[0])
+
+    def test_profile_name_match(self):
+        r = _run_cli(["--profile-name", "P1",  # P1 is the second one
+                      self.cam.url("/onvif/device_service")])
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        stream_bodies = [b for path, action, b in self.cam.requests
+                         if action.endswith("GetStreamUri")]
+        self.assertIn(b"<trt:ProfileToken>SubProfile</trt:ProfileToken>",
+                      stream_bodies[0])
+
+    def test_profile_index_out_of_range(self):
+        r = _run_cli(["--profile-index", "9",
+                      self.cam.url("/onvif/device_service")])
+        self.assertEqual(r.returncode, 4)
+        self.assertIn("out of range", r.stderr)
+
+    def test_list_profiles(self):
+        r = _run_cli(["--list-profiles",
+                      self.cam.url("/onvif/device_service")])
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        # One TOKEN<TAB>NAME line per profile.
+        lines = r.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], "MainProfile\tP0")
+        self.assertEqual(lines[1], "SubProfile\tP1")
+        # GetStreamUri must NOT have been called in --list-profiles mode.
+        actions = [action for path, action, b in self.cam.requests]
+        self.assertNotIn(
+            "http://www.onvif.org/ver10/media/wsdl/GetStreamUri",
+            actions,
+        )
 
 
 class CliErrorPathTests(unittest.TestCase):
@@ -401,12 +537,12 @@ class CliErrorPathTests(unittest.TestCase):
     def test_password_without_user(self):
         r = _run_cli(["--password", "x", "http://1.2.3.4/onvif/device_service"])
         self.assertEqual(r.returncode, 1)
-        self.assertIn("--password given without --user", r.stderr)
+        self.assertIn("password given without username", r.stderr)
 
     def test_user_without_password(self):
         r = _run_cli(["--user", "x", "http://1.2.3.4/onvif/device_service"])
         self.assertEqual(r.returncode, 1)
-        self.assertIn("--user given without --password", r.stderr)
+        self.assertIn("username given without password", r.stderr)
 
     def test_connection_refused(self):
         # Bind+release a port so we know it's free, then point the script at it.

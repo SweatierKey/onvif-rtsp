@@ -37,11 +37,14 @@ Write the result to a file:
 | Flag | Default | Meaning |
 |---|---|---|
 | `DEVICE_URL` (positional) | from stdin | ONVIF device service URL (must start with `http://` or `https://`) |
-| `--user USER` | unset | ONVIF username; must be paired with `--password` |
-| `--password PASSWORD` | unset | ONVIF password; must be paired with `--user` |
-| `--inject-credentials` | off | prepend URL-encoded `user:password@` to the RTSP URL (requires `--user`/`--password`; overwrites any userinfo already in the URL and warns on stderr if it does so) |
+| `--user USER` | `$ONVIF_USER` | ONVIF username; CLI flag wins over env var, but both are accepted |
+| `--password PASSWORD` | `$ONVIF_PASSWORD` | ONVIF password; same env-var fallback. **Prefer the env vars in scripts and systemd units** — argv leaks to `/proc/<pid>/cmdline` and `ps -ef`. |
+| `--inject-credentials` | off | prepend URL-encoded `user:password@` to the RTSP URL (requires credentials; overwrites any userinfo already in the URL and warns on stderr if it does so) |
+| `--profile-index N` | `0` | zero-based index of the media profile to query (0 = first, conventionally main stream) |
+| `--profile-name NAME` | unset | match a profile by its `Name` (e.g. `MainStream`) or by its token; wins over `--profile-index` |
+| `--list-profiles` | off | list the device's media profiles (`TOKEN<TAB>NAME` per line) and exit; does not call `GetStreamUri` |
 | `-t`, `--timeout SECONDS` | `10.0` | per-request HTTP timeout |
-| `-o`, `--output FILE` | stdout | write the RTSP URL to FILE instead of stdout |
+| `-o`, `--output FILE` | stdout | write the result (RTSP URL or profile listing) to FILE instead of stdout |
 | `-v`, `--verbose` | off | log progress on stderr (passwords are never logged) |
 | `-V`, `--version` | | print version and exit |
 | `-h`, `--help` | | show help and exit |
@@ -52,7 +55,25 @@ wins (standard Unix convention).
 
 The script makes three SOAP calls — `GetCapabilities` (Media), `GetProfiles`,
 `GetStreamUri` (RTP-Unicast / RTSP) — and prints whatever URI the device
-returns, verbatim, followed by a newline.
+returns, verbatim, followed by a newline. With `--list-profiles` only the
+first two calls are made.
+
+### Selecting a non-default media profile
+
+Most cameras expose at least two profiles: a high-resolution main stream
+(profile 0) and a lower-resolution sub-stream (profile 1). Use one of:
+
+    onvif-rtsp --list-profiles http://192.168.1.64/onvif/device_service
+    onvif-rtsp --profile-index 1 http://192.168.1.64/onvif/device_service
+    onvif-rtsp --profile-name SubStream http://192.168.1.64/onvif/device_service
+
+### Credentials via environment variables
+
+Equivalent to `--user admin --password segreta`, but the password never
+appears in argv:
+
+    ONVIF_USER=admin ONVIF_PASSWORD=segreta \
+        onvif-rtsp --inject-credentials http://192.168.1.64/onvif/device_service
 
 When credentials are provided, every request carries a fresh WS-Security
 UsernameToken with PasswordDigest (SHA-1). Nonces and timestamps are
